@@ -24,6 +24,7 @@ export interface Profile {
   auto_launch: boolean;
   color_scheme: string | null;
   launch_args: string[];
+  extensions: string[];
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -55,6 +56,7 @@ export interface ProfileCreateData {
   auto_launch?: boolean;
   color_scheme?: string | null;
   launch_args?: string[];
+  extensions?: string[];
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }
@@ -70,7 +72,22 @@ export interface LaunchResult {
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
+  binary_tier: string;
+  wrapper_version: string;
+  platform: string;
   profiles_total: number;
+  max_running_profiles: number | null;
+  available_slots: number | null;
+  extensions_count: number;
+}
+
+export interface Extension {
+  id: string;
+  name: string;
+  version: string;
+  default: boolean;
+  source: string;
+  cached: boolean;
 }
 
 class ApiError extends Error {
@@ -121,6 +138,8 @@ export const api = {
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
 
   listProfiles: () => request<Profile[]>("/api/profiles"),
+
+  listExtensions: () => request<Extension[]>("/api/extensions"),
 
   getProfile: (id: string) => request<Profile>(`/api/profiles/${id}`),
 

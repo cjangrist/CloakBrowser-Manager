@@ -1,6 +1,6 @@
 import { Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Profile, ProfileCreateData } from "../lib/api";
+import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
@@ -67,6 +67,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     clipboard_sync: true,
     auto_launch: false,
     launch_args: [],
+    extensions: [],
     tags: [],
   });
 
@@ -75,6 +76,28 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
+  const [availableExtensions, setAvailableExtensions] = useState<Extension[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    api.listExtensions()
+      .then((extensions) => {
+        if (!active) return;
+        setAvailableExtensions(extensions);
+        if (!profile) {
+          setForm((current) => ({
+            ...current,
+            extensions: extensions.filter((extension) => extension.default).map((extension) => extension.id),
+          }));
+        }
+      })
+      .catch(() => {
+        if (active) setAvailableExtensions([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [profile?.id]);
 
   useEffect(() => {
     if (profile) {
@@ -99,6 +122,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         auto_launch: profile.auto_launch,
         color_scheme: profile.color_scheme,
         launch_args: profile.launch_args ?? [],
+        extensions: profile.extensions ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
       });
@@ -479,6 +503,36 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           </div>
         </section>
 
+        {availableExtensions.length > 0 && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
+            <div className="space-y-2">
+              {availableExtensions.map((extension) => (
+                <label
+                  key={extension.id}
+                  className="flex items-center justify-between gap-3 text-sm text-gray-300 cursor-pointer"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <input
+                      type="checkbox"
+                      checked={(form.extensions ?? []).includes(extension.id)}
+                      onChange={(event) => {
+                        const selected = new Set(form.extensions ?? []);
+                        if (event.target.checked) selected.add(extension.id);
+                        else selected.delete(extension.id);
+                        set("extensions", Array.from(selected));
+                      }}
+                      className="rounded border-border bg-surface-2"
+                    />
+                    <span className="truncate">{extension.name}</span>
+                  </span>
+                  <span className="text-xs text-gray-500 font-mono shrink-0">v{extension.version}</span>
+                </label>
+              ))}
+            </div>
+          </section>
+        )}
+
         {/* Tags */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Tags</h3>
@@ -534,7 +588,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         {/* Launch Args */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Launch Args</h3>
-          <p className="text-xs text-gray-500 mb-2">Custom Chromium flags passed at launch (e.g. --load-extension, --disable-features)</p>
+          <p className="text-xs text-gray-500 mb-2">Custom Chromium flags passed at launch</p>
           {(form.launch_args ?? []).length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-3">
               {(form.launch_args ?? []).map((arg, idx) => (
@@ -560,7 +614,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               value={launchArgInput}
               onChange={(e) => setLaunchArgInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addLaunchArg(); } }}
-              placeholder="--load-extension=/data/extensions/ublock"
+              placeholder="--disable-features=ExampleFeature"
             />
             <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">
               Add

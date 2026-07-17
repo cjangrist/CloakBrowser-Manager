@@ -1,0 +1,12 @@
+.git
+.github
+.beads
+**/__pycache__
+**/*.pyc
+backend/tests
+frontend/dist
+frontend/node_modules
+tmp
+trash
+*.db
+*.log

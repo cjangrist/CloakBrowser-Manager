@@ -14,6 +14,7 @@ from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
+from .extensions import extension_paths
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
@@ -51,6 +52,57 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _write_download_preferences(user_data_dir: Path, downloads_dir: Path) -> None:
+    """Persist Chrome download preferences without replacing unrelated settings."""
+    preferences_path = user_data_dir / "Default" / "Preferences"
+    preferences: dict[str, Any] = {}
+    if preferences_path.exists():
+        try:
+            preferences = json.loads(preferences_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Ignoring malformed preferences at %s: %s", preferences_path, exc)
+    download_preferences = preferences.get("download", {})
+    if not isinstance(download_preferences, dict):
+        download_preferences = {}
+    preferences["download"] = {
+        **download_preferences,
+        "default_directory": str(downloads_dir),
+        "directory_upgrade": True,
+        "prompt_for_download": False,
+    }
+    preferences_path.write_text(json.dumps(preferences, indent=2))
+
+
+async def _configure_native_downloads(context: Any, downloads_dir: Path) -> None:
+    """Tell Chromium to retain website-provided filenames in persistent storage."""
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    pages = list(context.pages)
+    page = pages[0] if pages else await context.new_page()
+    session = await context.new_cdp_session(page)
+    try:
+        await session.send(
+            "Browser.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": str(downloads_dir),
+                "eventsEnabled": True,
+            },
+        )
+    finally:
+        await session.detach()
+
+
+def _register_download_reconfiguration(context: Any, downloads_dir: Path) -> None:
+    """Restore the download policy when an external CDP client opens a page."""
+    async def configure_downloads(_: Any) -> None:
+        try:
+            await _configure_native_downloads(context, downloads_dir)
+        except Exception as exc:
+            logger.warning("Failed to restore download policy: %s", exc)
+
+    context.on("page", lambda page: asyncio.create_task(configure_downloads(page)))
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -155,14 +207,39 @@ class RunningProfile:
     cdp_port: int
 
 
+class BrowserCapacityError(RuntimeError):
+    """Raised when launching would exceed the configured browser limit."""
+
+
 class BrowserManager:
-    def __init__(self):
+    def __init__(
+        self,
+        max_running_profiles: int = 0,
+        extensions_catalog: list[dict[str, Any]] | None = None,
+        downloads_root: Path = Path("/data/downloads"),
+        fonts_dir: Path | None = None,
+    ):
         self.running: dict[str, RunningProfile] = {}
-        self._launching: set[str] = set()  # profile IDs currently being launched
+        self._launching: set[str] = set()
         self.vnc = VNCManager()
         self._lock = asyncio.Lock()
         self._next_cdp_port = BASE_CDP_PORT
         self._auto_launch_task: asyncio.Task | None = None
+        self.max_running_profiles = max_running_profiles
+        self.extensions_catalog = extensions_catalog or []
+        self.downloads_root = downloads_root
+        self.fonts_dir = fonts_dir
+
+    def configure_extensions(self, catalog: list[dict[str, Any]]) -> None:
+        """Replace the launchable extension catalog after startup provisioning."""
+        self.extensions_catalog = list(catalog)
+
+    def available_slots(self) -> int | None:
+        """Return available launch slots, or None when no cap is configured."""
+        if not self.max_running_profiles:
+            return None
+        active = len(self.running) + len(self._launching)
+        return max(self.max_running_profiles - active, 0)
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance for the given profile."""
@@ -171,6 +248,10 @@ class BrowserManager:
         async with self._lock:
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
+            if self.available_slots() == 0:
+                raise BrowserCapacityError(
+                    f"Running profile limit reached ({self.max_running_profiles})"
+                )
             self._launching.add(profile_id)
 
         display, ws_port = await self.vnc.allocate()
@@ -191,6 +272,9 @@ class BrowserManager:
 
         # Set up bookmarks and search engine on first launch
         _init_profile_defaults(user_data_dir)
+        downloads_dir = self.downloads_root / profile_id
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        _write_download_preferences(user_data_dir, downloads_dir)
 
         try:
             # Start KasmVNC on the allocated display
@@ -205,6 +289,10 @@ class BrowserManager:
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
             extra_args.append(f"--remote-debugging-port={cdp_port}")
+            selected_extensions = profile.get("extensions") or []
+            resolved_extensions = extension_paths(
+                selected_extensions, self.extensions_catalog
+            )
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
             raw_proxy = profile.get("proxy") or None
@@ -230,8 +318,12 @@ class BrowserManager:
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
                 },
+                extension_paths=resolved_extensions or None,
                 env={**os.environ, "DISPLAY": f":{display}"},
             )
+
+            await _configure_native_downloads(context, downloads_dir)
+            _register_download_reconfiguration(context, downloads_dir)
 
             # Inject clipboard listener: captures copied text on every page
             # so the GET /clipboard endpoint can read it via page.evaluate()
@@ -383,6 +475,9 @@ class BrowserManager:
             "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
             "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
         ]
+
+        if self.fonts_dir and self.fonts_dir.is_dir():
+            args.append(f"--fingerprint-fonts-dir={self.fonts_dir}")
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:

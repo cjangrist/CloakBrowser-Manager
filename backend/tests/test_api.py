@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ from starlette.testclient import TestClient
 
 from backend import main
 from backend.browser_manager import RunningProfile
+from backend.main import _rewrite_download_command
 
 
 # ── Profile CRUD ─────────────────────────────────────────────────────────────
@@ -188,7 +190,37 @@ def test_system_status(app_client: TestClient):
     data = resp.json()
     assert data["running_count"] == 0
     assert data["binary_version"] == "0.0.0-test"
+    assert data["binary_tier"] == "test"
+    assert data["wrapper_version"] == "0.0.0-test"
+    assert data["extensions_count"] == 0
     assert data["profiles_total"] >= 1
+
+
+def test_extension_catalog_and_profile_defaults(app_client: TestClient):
+    extension_id = "a" * 32
+    main.extension_catalog = [{
+        "id": extension_id,
+        "name": "Configured Extension",
+        "version": "1.0",
+        "path": "/data/extensions/configured",
+        "default": True,
+        "source": "chrome_web_store",
+        "cached": False,
+    }]
+    main.browser_mgr.configure_extensions(main.extension_catalog)
+    catalog_response = app_client.get("/api/extensions")
+    assert catalog_response.status_code == 200
+    assert "path" not in catalog_response.json()[0]
+    profile_response = app_client.post("/api/profiles", json={"name": "DefaultExt"})
+    assert profile_response.status_code == 201
+    assert profile_response.json()["extensions"] == [extension_id]
+
+
+def test_profile_rejects_unconfigured_extension(app_client: TestClient):
+    response = app_client.post(
+        "/api/profiles", json={"name": "UnknownExt", "extensions": ["a" * 32]}
+    )
+    assert response.status_code == 422
 
 
 # ── Launch Args ─────────────────────────────────────────────────────────────
@@ -374,6 +406,21 @@ def test_cdp_json_version_not_running(app_client: TestClient):
     assert resp.status_code == 404
 
 
+def test_cdp_download_policy_is_rewritten_to_durable_path(tmp_path: Path):
+    message = json.dumps({
+        "id": 7,
+        "method": "Browser.setDownloadBehavior",
+        "params": {"behavior": "allowAndName", "downloadPath": "/tmp/client"},
+    })
+    rewritten = json.loads(_rewrite_download_command(message, tmp_path))
+    assert rewritten["id"] == 7
+    assert rewritten["params"] == {
+        "behavior": "allow",
+        "downloadPath": str(tmp_path),
+        "eventsEnabled": True,
+    }
+
+
 def test_cdp_json_list_not_running(app_client: TestClient):
     resp = app_client.get("/api/profiles/nonexistent/cdp/json/list")
     assert resp.status_code == 404
@@ -540,7 +587,7 @@ def test_ws_allows_same_origin(app_client: TestClient):
         with app_client.websocket_connect(
             f"/api/profiles/{pid}/vnc",
             headers={"origin": "http://testserver"},
-        ) as ws:
+        ):
             pass  # connection accepted = Origin check passed
     except Exception as exc:
         # Any error other than 4403 means Origin check passed
@@ -555,7 +602,7 @@ def test_ws_allows_no_origin(app_client: TestClient):
     _mock_running_profile(pid)
 
     try:
-        with app_client.websocket_connect(f"/api/profiles/{pid}/vnc") as ws:
+        with app_client.websocket_connect(f"/api/profiles/{pid}/vnc"):
             pass
     except Exception as exc:
         assert "4403" not in str(exc)

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger("cloakbrowser.manager.vnc")
 

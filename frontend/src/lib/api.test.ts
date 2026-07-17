@@ -32,6 +32,15 @@ describe("api.listProfiles", () => {
   });
 });
 
+describe("api.listExtensions", () => {
+  it("returns the provisioned extension catalog", async () => {
+    const extensions = [{ id: "a".repeat(32), name: "uBlock Origin Lite", version: "1" }];
+    mockFetch.mockResolvedValueOnce(jsonResponse(extensions));
+    await expect(api.listExtensions()).resolves.toEqual(extensions);
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/extensions");
+  });
+});
+
 // ── createProfile ───────────────────────────────────────────────────────────
 
 describe("api.createProfile", () => {

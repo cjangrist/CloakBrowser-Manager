@@ -1,9 +1,19 @@
 services:
   manager:
+    image: ${CLOAKBROWSER_MANAGER_IMAGE:-ghcr.io/cjangrist/cloakbrowser-manager:latest}
     build: .
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - ~/.cloakbrowser-manager:/data
     environment:
-      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - AUTH_TOKEN
+      - CLOAKBROWSER_AUTO_UPDATE
+      - CLOAKBROWSER_DOWNLOADS_DIR
+      - CLOAKBROWSER_EXTENSION_IDS
+      - CLOAKBROWSER_EXTENSIONS_DIR
+      - CLOAKBROWSER_FONTS_DIR
+      - CLOAKBROWSER_LICENSE_KEY
+      - CLOAKBROWSER_MANAGER_AUTH_TOKEN
+      - CLOAKBROWSER_REQUIRE_LICENSE
+      - MAX_RUNNING_PROFILES

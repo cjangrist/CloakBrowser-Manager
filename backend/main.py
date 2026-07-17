@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import struct
@@ -16,6 +17,7 @@ from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -25,9 +27,11 @@ import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
-from .browser_manager import BrowserManager
+from .browser_manager import BrowserCapacityError, BrowserManager
+from .extensions import parse_extension_ids, public_catalog, sync_extensions
 from .models import (
     ClipboardRequest,
+    ExtensionResponse,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
@@ -37,6 +41,7 @@ from .models import (
     StatusResponse,
     TagResponse,
 )
+from .runtime import prepare_cloakbrowser_runtime, resolve_auth_token, runtime_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -45,17 +50,61 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-# Optional authentication via AUTH_TOKEN env var.
+# Optional authentication via a deployment-specific or legacy token env var.
 # If not set, all routes are open (local dev). If set, all /api/* routes
 # (except /api/auth/* and /api/status) require Bearer token or cookie.
-AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
+AUTH_TOKEN: str | None = resolve_auth_token(
+    os.environ.get("CLOAKBROWSER_MANAGER_AUTH_TOKEN"),
+    os.environ.get("AUTH_TOKEN"),
+)
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
+_PUBLIC_CDP_DISCOVERY_SUFFIXES = frozenset({
+    (),
+    ("",),
+    ("json",),
+    ("json", ""),
+    ("json", "list"),
+    ("json", "list", ""),
+    ("json", "version"),
+    ("json", "version", ""),
+})
+
+
+def _is_public_cdp_path(path: str) -> bool:
+    """Allow capability-style CDP URLs only for canonical v4 profile UUIDs."""
+    parts = path.split("/")
+    if len(parts) < 5 or parts[:3] != ["", "api", "profiles"]:
+        return False
+    if parts[4] != "cdp":
+        return False
+    try:
+        profile_id = UUID(parts[3])
+    except ValueError:
+        return False
+    if profile_id.version != 4 or str(profile_id) != parts[3]:
+        return False
+    suffix = tuple(parts[5:])
+    if suffix in _PUBLIC_CDP_DISCOVERY_SUFFIXES:
+        return True
+    return (
+        len(suffix) == 3
+        and suffix[0] == "devtools"
+        and suffix[1] in {"browser", "page"}
+        and bool(suffix[2])
+    )
 
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie)."""
+    for key, val in scope.get("headers", []):
+        if key == b"x-cloak-auth-token":
+            token = val.decode()
+            if token and hmac.compare_digest(token, AUTH_TOKEN):
+                return True
+            break
+
     # Check Authorization: Bearer <token> header
     for key, val in scope.get("headers", []):
         if key == b"authorization":
@@ -154,8 +203,12 @@ class AuthMiddleware:
 
         path = scope["path"]
 
-        # Skip auth for exempt endpoints and non-API paths (static frontend)
-        if path in _AUTH_EXEMPT or not path.startswith("/api/"):
+        # Skip auth for health/bootstrap, capability CDP, and static frontend paths.
+        if (
+            path in _AUTH_EXEMPT
+            or _is_public_cdp_path(path)
+            or not path.startswith("/api/")
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -173,8 +226,22 @@ class AuthMiddleware:
             await response(scope, receive, send)
 
 
-# Singleton browser manager
-browser_mgr = BrowserManager()
+SETTINGS = runtime_settings()
+CONFIGURED_EXTENSION_IDS = parse_extension_ids(SETTINGS["extension_ids_raw"])
+EXTENSIONS_ROOT = Path(SETTINGS["extensions_root"])
+runtime_info: dict[str, str] = {
+    "wrapper_version": "starting",
+    "binary_version": "starting",
+    "binary_tier": "starting",
+    "platform": "starting",
+}
+extension_catalog: list[dict[str, object]] = []
+
+browser_mgr = BrowserManager(
+    max_running_profiles=SETTINGS["max_running_profiles"],
+    downloads_root=Path(SETTINGS["downloads_root"]),
+    fonts_dir=Path(SETTINGS["fonts_dir"]),
+)
 
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
@@ -374,6 +441,18 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global extension_catalog, runtime_info
+
+    runtime_info = await asyncio.to_thread(
+        prepare_cloakbrowser_runtime, SETTINGS["require_license"]
+    )
+    extension_catalog = await asyncio.to_thread(
+        sync_extensions,
+        CONFIGURED_EXTENSION_IDS,
+        EXTENSIONS_ROOT,
+        runtime_info["binary_version"],
+    )
+    browser_mgr.configure_extensions(extension_catalog)
     db.init_db()
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -435,6 +514,21 @@ async def auth_logout(request: Request, response: Response):
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
+def _validate_configured_extensions(extension_ids: list[str]) -> None:
+    configured = {str(entry["id"]) for entry in extension_catalog}
+    unknown = [extension_id for extension_id in extension_ids if extension_id not in configured]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Extensions are not configured: {', '.join(unknown)}",
+        )
+
+
+@app.get("/api/extensions", response_model=list[ExtensionResponse])
+async def list_extensions():
+    return [ExtensionResponse(**entry) for entry in public_catalog(extension_catalog)]
+
+
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
     profiles = db.list_profiles()
@@ -452,6 +546,11 @@ async def list_profiles():
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
 async def create_profile(req: ProfileCreate):
     data = req.model_dump()
+    if "extensions" not in req.model_fields_set:
+        data["extensions"] = [
+            str(entry["id"]) for entry in extension_catalog if entry.get("default")
+        ]
+    _validate_configured_extensions(data["extensions"])
     tags = data.pop("tags", None)
     if tags:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
@@ -483,6 +582,8 @@ async def get_profile(profile_id: str):
 async def update_profile(profile_id: str, req: ProfileUpdate):
     # Only pass fields that were explicitly set
     data = req.model_dump(exclude_unset=True)
+    if data.get("extensions") is not None:
+        _validate_configured_extensions(data["extensions"])
     tags = data.pop("tags", None)
     if tags is not None:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
@@ -532,6 +633,8 @@ async def launch_profile(profile_id: str):
 
     try:
         running = await browser_mgr.launch(profile)
+    except BrowserCapacityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -569,13 +672,17 @@ async def get_profile_status(profile_id: str):
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    from cloakbrowser.config import CHROMIUM_VERSION
-
     profiles = db.list_profiles()
     return StatusResponse(
         running_count=len(browser_mgr.running),
-        binary_version=CHROMIUM_VERSION,
+        binary_version=runtime_info["binary_version"],
+        binary_tier=runtime_info["binary_tier"],
+        wrapper_version=runtime_info["wrapper_version"],
+        platform=runtime_info["platform"],
         profiles_total=len(profiles),
+        max_running_profiles=browser_mgr.max_running_profiles or None,
+        available_slots=browser_mgr.available_slots(),
+        extensions_count=len(extension_catalog),
     )
 
 
@@ -912,7 +1019,10 @@ async def cdp_json_list(profile_id: str, request: Request):
 
 
 async def _proxy_cdp_websocket(
-    websocket: WebSocket, target_url: str, label: str,
+    websocket: WebSocket,
+    target_url: str,
+    label: str,
+    download_path: Path,
 ) -> None:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
@@ -933,7 +1043,10 @@ async def _proxy_cdp_websocket(
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"]:
-                            await cdp_ws.send(msg["text"])
+                            rewritten = _rewrite_download_command(
+                                msg["text"], download_path
+                            )
+                            await cdp_ws.send(rewritten)
                         elif "bytes" in msg and msg["bytes"]:
                             await cdp_ws.send(msg["bytes"])
                 except WebSocketDisconnect:
@@ -971,6 +1084,30 @@ async def _proxy_cdp_websocket(
             logger.debug("%s: websocket.close() failed: %s", label, exc)
 
 
+def _rewrite_download_command(message: str, download_path: Path) -> str:
+    """Keep external CDP clients from replacing the durable download path."""
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return message
+    if payload.get("method") not in {
+        "Browser.setDownloadBehavior",
+        "Page.setDownloadBehavior",
+    }:
+        return message
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    payload["params"] = {
+        **params,
+        "behavior": "allow",
+        "downloadPath": str(download_path),
+        "eventsEnabled": True,
+    }
+    logger.info("Rewrote external CDP download path to %s", download_path)
+    return json.dumps(payload, separators=(",", ":"))
+
+
 @app.websocket("/api/profiles/{profile_id}/cdp")
 async def cdp_proxy(websocket: WebSocket, profile_id: str):
     """Proxy WebSocket frames between external tools and Chrome's CDP."""
@@ -996,7 +1133,12 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
+    await _proxy_cdp_websocket(
+        websocket,
+        ws_url,
+        f"CDP proxy [{profile_id}]",
+        browser_mgr.downloads_root / profile_id,
+    )
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
@@ -1013,7 +1155,12 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     await websocket.accept()
 
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
+    await _proxy_cdp_websocket(
+        websocket,
+        target_url,
+        f"CDP page proxy [{profile_id}]",
+        browser_mgr.downloads_root / profile_id,
+    )
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────

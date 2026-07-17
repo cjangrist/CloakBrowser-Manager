@@ -52,6 +52,7 @@ def init_db():
                 clipboard_sync BOOLEAN DEFAULT 1,
                 auto_launch BOOLEAN DEFAULT 0,
                 color_scheme TEXT,
+                extensions TEXT DEFAULT '[]',
                 notes TEXT,
                 user_data_dir TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -78,6 +79,9 @@ def init_db():
         if "auto_launch" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN auto_launch BOOLEAN DEFAULT 0")
             conn.commit()
+        if "extensions" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN extensions TEXT DEFAULT '[]'")
+            conn.commit()
 
 
 def _now() -> str:
@@ -101,9 +105,9 @@ def create_profile(
                 id, name, fingerprint_seed, proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
-                clipboard_sync, auto_launch, color_scheme, launch_args, notes,
+                clipboard_sync, auto_launch, color_scheme, launch_args, extensions, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -124,6 +128,7 @@ def create_profile(
                 fields.get("auto_launch", False),
                 fields.get("color_scheme"),
                 json.dumps(fields.get("launch_args") or []),
+                json.dumps(fields.get("extensions") or []),
                 fields.get("notes"),
                 user_data_dir, now, now,
             ),
@@ -145,6 +150,7 @@ def get_profile(profile_id: str) -> dict[str, Any] | None:
             return None
         profile = dict(row)
         profile["launch_args"] = json.loads(profile.get("launch_args") or "[]")
+        profile["extensions"] = json.loads(profile.get("extensions") or "[]")
         tags = conn.execute(
             "SELECT tag, color FROM profile_tags WHERE profile_id = ?",
             (profile_id,),
@@ -160,6 +166,7 @@ def list_profiles() -> list[dict[str, Any]]:
         for row in rows:
             profile = dict(row)
             profile["launch_args"] = json.loads(profile.get("launch_args") or "[]")
+            profile["extensions"] = json.loads(profile.get("extensions") or "[]")
             tags = conn.execute(
                 "SELECT tag, color FROM profile_tags WHERE profile_id = ?",
                 (profile["id"],),
@@ -182,12 +189,14 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     # Pre-serialize launch_args to JSON before the generic update loop
     if "launch_args" in fields:
         fields["launch_args"] = json.dumps(fields["launch_args"] or [])
+    if "extensions" in fields:
+        fields["extensions"] = json.dumps(fields["extensions"] or [])
 
     for col in (
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
-        "clipboard_sync", "auto_launch", "color_scheme", "launch_args", "notes",
+        "clipboard_sync", "auto_launch", "color_scheme", "launch_args", "extensions", "notes",
     ):
         if col in fields:
             update_cols.append(f"{col} = ?")

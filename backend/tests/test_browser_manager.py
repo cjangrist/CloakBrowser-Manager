@@ -11,10 +11,12 @@ import socket
 
 from backend.browser_manager import (
     BASE_CDP_PORT,
+    BrowserCapacityError,
     CDP_PORT_RANGE,
     _init_profile_defaults,
     _normalize_proxy,
     _validate_proxy,
+    _write_download_preferences,
     BrowserManager,
 )
 
@@ -142,6 +144,12 @@ def test_build_args_empty_profile():
     assert len(args) == 3
 
 
+def test_build_args_includes_mounted_font_directory(tmp_path: Path):
+    manager = BrowserManager(fonts_dir=tmp_path)
+    args = manager._build_fingerprint_args({})
+    assert f"--fingerprint-fonts-dir={tmp_path}" in args
+
+
 # ── launch_args appended to extra_args ────────────────────────────────────────
 
 
@@ -254,11 +262,37 @@ def test_init_creates_preferences(tmp_path: Path):
 def test_init_idempotent(tmp_path: Path):
     _init_profile_defaults(tmp_path)
     bookmarks_path = tmp_path / "Default" / "Bookmarks"
-    original = bookmarks_path.read_text()
-
     # Write a sentinel to the file
     bookmarks_path.write_text("SENTINEL")
 
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+def test_download_preferences_preserve_existing_values(tmp_path: Path):
+    _init_profile_defaults(tmp_path)
+    preferences_path = tmp_path / "Default" / "Preferences"
+    preferences = json.loads(preferences_path.read_text())
+    preferences["unrelated"] = {"enabled": True}
+    preferences_path.write_text(json.dumps(preferences))
+    downloads_dir = tmp_path / "downloads"
+    _write_download_preferences(tmp_path, downloads_dir)
+    updated = json.loads(preferences_path.read_text())
+    assert updated["unrelated"] == {"enabled": True}
+    assert updated["download"]["default_directory"] == str(downloads_dir)
+
+
+def test_available_slots_counts_running_and_launching():
+    manager = BrowserManager(max_running_profiles=3)
+    manager.running["one"] = object()
+    manager._launching.add("two")
+    assert manager.available_slots() == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_rejects_when_concurrent_capacity_is_reserved():
+    manager = BrowserManager(max_running_profiles=1)
+    manager._launching.add("already-launching")
+    with pytest.raises(BrowserCapacityError, match="limit reached"):
+        await manager.launch({"id": "new-profile"})

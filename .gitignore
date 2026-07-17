@@ -24,3 +24,5 @@ CLAUDE.md
 publish-docker.sh
 .beads
 debug
+tmp/
+trash/

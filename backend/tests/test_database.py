@@ -5,8 +5,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
-
 from backend import database as db
 
 
@@ -138,6 +136,14 @@ def test_list_profiles_includes_launch_args(tmp_db: Path):
     args_by_name = {p["name"]: p["launch_args"] for p in profiles}
     assert args_by_name["A"] == ["--arg1"]
     assert args_by_name["B"] == []
+
+
+def test_profile_extensions_roundtrip(tmp_db: Path):
+    extension_ids = ["a" * 32, "b" * 32]
+    profile = db.create_profile("Extensions", extensions=extension_ids)
+    assert profile["extensions"] == extension_ids
+    updated = db.update_profile(profile["id"], extensions=["c" * 32])
+    assert updated["extensions"] == ["c" * 32]
 
 
 # ── get_profile ──────────────────────────────────────────────────────────────

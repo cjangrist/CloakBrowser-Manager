@@ -10,9 +10,7 @@ from backend.models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
-    StatusResponse,
     TagCreate,
-    TagResponse,
 )
 
 

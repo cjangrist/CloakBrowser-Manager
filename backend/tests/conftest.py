@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -27,6 +27,25 @@ sys.modules.setdefault("cloakbrowser.config", _mock_config)
 
 
 from backend import database as db  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_manager_runtime(monkeypatch: pytest.MonkeyPatch):
+    """Keep startup preparation deterministic and offline in unit tests."""
+    from backend import main
+
+    runtime = {
+        "wrapper_version": "0.0.0-test",
+        "binary_version": "0.0.0-test",
+        "binary_tier": "test",
+        "platform": "test-platform",
+    }
+    monkeypatch.setattr(main, "prepare_cloakbrowser_runtime", lambda required: runtime)
+    monkeypatch.setattr(main, "sync_extensions", lambda ids, root, version: [])
+    monkeypatch.setattr(main.browser_mgr, "max_running_profiles", 0)
+    main.browser_mgr.configure_extensions([])
+    main.browser_mgr.running.clear()
+    main.browser_mgr._launching.clear()
 
 
 @pytest.fixture()

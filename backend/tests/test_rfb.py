@@ -11,7 +11,6 @@ from backend.main import (
     _rewrite_pointer_event,
     _rewrite_set_encodings,
     _rfb_msg_length,
-    _ALLOWED_ENCODINGS,
 )
 
 
